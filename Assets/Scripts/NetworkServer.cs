@@ -3,6 +3,8 @@ using UnityEngine.Assertions;
 using Unity.Collections;
 using Unity.Networking.Transport;
 using System.Text;
+using System.IO;
+using UnityEditor.MemoryProfiler;
 
 public class NetworkServer : MonoBehaviour
 {
@@ -12,7 +14,7 @@ public class NetworkServer : MonoBehaviour
     NetworkPipeline reliableAndInOrderPipeline;
     NetworkPipeline nonReliableNotInOrderedPipeline;
 
-    const ushort NetworkPort = 9001;
+    const ushort NetworkPort = 9002;
 
     const int MaxNumberOfClientConnections = 1000;
 
@@ -21,8 +23,13 @@ public class NetworkServer : MonoBehaviour
         networkDriver = NetworkDriver.Create();
         reliableAndInOrderPipeline = networkDriver.CreatePipeline(typeof(FragmentationPipelineStage), typeof(ReliableSequencedPipelineStage));
         nonReliableNotInOrderedPipeline = networkDriver.CreatePipeline(typeof(FragmentationPipelineStage));
-        NetworkEndPoint endpoint = NetworkEndPoint.AnyIpv4;
-        endpoint.Port = NetworkPort;
+
+        // Public IP address
+        //NetworkEndPoint endpoint = NetworkEndPoint.Parse("192.168.2.43", NetworkPort);
+
+        // Home Local Network
+        NetworkEndPoint endpoint = NetworkEndPoint.Parse("127.0.0.1", NetworkPort);
+
 
         int error = networkDriver.Bind(endpoint);
         if (error != 0)
@@ -47,7 +54,10 @@ public class NetworkServer : MonoBehaviour
         {
             for (int i = 0; i < networkConnections.Length; i++)
             {
-                SendMessageToClient("Hello client's world, sincerely your network server", networkConnections[i]);
+                if (networkConnections[i].IsCreated)
+                {
+                    SendMessageToClient("Hello client's world, sincerely your network server", networkConnections[i].InternalId);
+                }
             }
         }
 
@@ -103,9 +113,13 @@ public class NetworkServer : MonoBehaviour
                         streamReader.ReadBytes(buffer);
                         byte[] byteBuffer = buffer.ToArray();
                         string msg = Encoding.Unicode.GetString(byteBuffer);
-                        ProcessReceivedMsg(msg);
+
+                        ProcessReceivedMsg(msg); // For logging purposes
+                        ProcessClientMessage(msg, networkConnections[i]); ; // Process the client's message
+
                         buffer.Dispose();
                         break;
+
                     case NetworkEvent.Type.Disconnect:
                         Debug.Log("Client has disconnected from server");
                         networkConnections[i] = default(NetworkConnection);
@@ -141,21 +155,149 @@ public class NetworkServer : MonoBehaviour
         Debug.Log("Msg received = " + msg);
     }
 
-    public void SendMessageToClient(string msg, NetworkConnection networkConnection)
+    public void SendMessageToClient(string msg, int connectionID)
     {
-        byte[] msgAsByteArray = Encoding.Unicode.GetBytes(msg);
-        NativeArray<byte> buffer = new NativeArray<byte>(msgAsByteArray, Allocator.Persistent);
-
-
-        //Driver.BeginSend(m_Connection, out var writer);
-        DataStreamWriter streamWriter;
-        //networkConnection.
-        networkDriver.BeginSend(reliableAndInOrderPipeline, networkConnection, out streamWriter);
-        streamWriter.WriteInt(buffer.Length);
-        streamWriter.WriteBytes(buffer);
-        networkDriver.EndSend(streamWriter);
-
-        buffer.Dispose();
+        foreach (var connection in networkConnections)
+        {
+            if (connection.InternalId == connectionID)
+            {
+                byte[] msgAsByteArray = Encoding.Unicode.GetBytes(msg);
+                using (NativeArray<byte> buffer = new NativeArray<byte>(msgAsByteArray, Allocator.Persistent))
+                {
+                    DataStreamWriter streamWriter;
+                    networkDriver.BeginSend(reliableAndInOrderPipeline, connection, out streamWriter);
+                    streamWriter.WriteInt(buffer.Length);
+                    streamWriter.WriteBytes(buffer);
+                    networkDriver.EndSend(streamWriter);
+                }
+                break;
+            }
+        }
     }
+
+    // Example method in NetworkServer to notify clients of a state change
+    public void NotifyStateChangeToClients(string newState)
+    {
+        string stateMessage = "StateChange:" + newState;
+        for (int i = 0; i < networkConnections.Length; i++)
+        {
+            if (networkConnections[i].IsCreated)
+            {
+                SendMessageToClient(stateMessage, networkConnections[i].InternalId);
+            }
+        }
+    }
+
+    private void ProcessClientMessage(string message, NetworkConnection connection)
+    {
+        Debug.Log("Processing Client Message");
+        string[] messageParts = message.Split(',');
+
+        if (messageParts.Length < 3)
+        {
+            // Handle error: message format is incorrect
+            return;
+        }
+
+        int signifier = int.Parse(messageParts[0]);
+        string username = messageParts[1];
+        string password = messageParts[2];
+        int connectionID = connection.InternalId; // Get the connection ID
+
+        switch (signifier)
+        {
+            case 1:
+                CreateAccount(username, password, connectionID);
+                break;
+            case 2:
+                PerformLogin(username, password, connectionID);
+                break;
+            default:
+                // Handle unknown signifier
+                break;
+        }
+
+        if (message.StartsWith("StateChangedSuccessfully:"))
+        {
+            string changedState = message.Substring("StateChangedSuccessfully:".Length);
+            // Handle the acknowledgment of state change
+            // For example, updating some server-side logic
+        }
+    }
+
+    private void CreateAccount(string username, string password, int connectionID)
+    {
+        string accountsFile = "Accounts.txt"; // Consider a more secure storage method
+        bool accountExists = false;
+
+        // Check if account already exists
+        if (File.Exists(accountsFile))
+        {
+            using (StreamReader reader = new StreamReader(accountsFile))
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    string[] parts = line.Split(',');
+                    if (parts[0] == username)
+                    {
+                        accountExists = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Create if does not exist
+        if (!accountExists)
+        {
+            using (StreamWriter writer = new StreamWriter(accountsFile, true))
+            {
+                writer.WriteLine($"{username},{password}"); // Insecure: consider hashing the password
+            }
+            Debug.Log("Account created successfully.");
+            SendMessageToClient("CreateAccountSuccess", connectionID);
+        }
+        else
+        {
+            Debug.Log("Account creation failed: Username already exists.");
+            SendMessageToClient("CreateAccountFail", connectionID);
+        }
+    }
+    private void PerformLogin(string username, string password, int connectionID)
+    {
+        string accountsFile = "Accounts.txt"; // The same file where accounts are stored
+        bool loginSuccess = false;
+
+        if (File.Exists(accountsFile))
+        {
+            using (StreamReader reader = new StreamReader(accountsFile))
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    string[] parts = line.Split(',');
+                    if (parts[0] == username && parts[1] == password) // Insecure: consider hashing the password
+                    {
+                        loginSuccess = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (loginSuccess)
+        {
+            Debug.Log("Login successful. ID: " + connectionID);
+            SendMessageToClient("StateChange:MainMenu", connectionID);
+        }
+
+        else
+        {
+            Debug.Log("Login failed: Username or password is incorrect.");
+            SendMessageToClient("LoginFail", connectionID);
+        }
+    }
+
 
 }
